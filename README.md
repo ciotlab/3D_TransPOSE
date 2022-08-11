@@ -9,6 +9,11 @@ https://drive.google.com/file/d/1sZYllTCnyNS4_KU7zE2YVqvMmFCVBPgP/view?usp=shari
     python main.py --resume_checkpoint ./outputs/checkpoint.pth
   
 ## Dataset
+
+dataset download
+
+https://drive.google.com/file/d/1Fkp_6UoefdByJaonBbvlaQ9aoDNYcf7l/view?usp=sharing
+
     📂train
     ├ 📂radar
     │  ├ 📂A
