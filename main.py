@@ -57,8 +57,8 @@ def get_args_parser():
 
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--seed', default=42, type=int)
-    parser.add_argument('--resume_checkpoint', default='./outputs/all_6/checkpoint.pth')
-    # parser.add_argument('--resume_checkpoint', default='')
+    # parser.add_argument('--resume_checkpoint', default='./outputs/all_6/checkpoint.pth')
+    parser.add_argument('--resume_checkpoint', default='')
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--start_epoch', default=0, type=int)
     parser.add_argument('--iou_threshold', default=0.7, type=float)
