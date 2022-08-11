@@ -198,26 +198,4 @@ if __name__ == '__main__':
     args = parser.parse_args()
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     Path(args.imaging_output_dir).mkdir(parents=True, exist_ok=True)
-
-    from slack_sdk.webhook import WebhookClient
-    from slack_sdk.errors import SlackApiError
-
-    url = "https://hooks.slack.com/services/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"
-    webhook = WebhookClient(url)
-    start = datetime.datetime.now()
-    msg_start = start.strftime("%c")
-    try:
-        response = webhook.send(text=msg_start)
-    except SlackApiError as e:
-        print(e)
-
     main(args)
-
-    end = datetime.datetime.now()
-    msg_end = end.strftime("%c")
-    try:
-        response = webhook.send(text=msg_end)
-    except SlackApiError as e:
-        print(e)
-
-    sys.exit()
