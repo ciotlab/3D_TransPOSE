@@ -11,6 +11,7 @@ from matplotlib.gridspec import GridSpec
 from einops import rearrange
 
 import util.misc as utils
+from models.criterion_2 import get_targets, transform_bbox
 from util.box_ops import box_3d_cxcyczwhd_to_xyzxyz, box_3d_iou
 from models.matcher import HungarianMatcher
 from data_processing.dataset import area_min_xyz, area_size_xyz
@@ -18,7 +19,7 @@ from data_processing.dataset_visualization import tx_antenna_position, rx_antenn
 
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
-                    data_loader: Iterable, weight_dict: Dict, optimizer: torch.optim.Optimizer,
+                    data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0, use_wandb=False):
     model.train()
     criterion.train()
@@ -31,7 +32,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         samples = samples.to(device)
         outputs = model(samples)
         loss_dict = criterion(outputs, targets)
-        total_loss = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
+        total_loss = sum(loss_dict[k] for k in loss_dict.keys())
 
         optimizer.zero_grad()
         total_loss.backward()
@@ -39,10 +40,10 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
         optimizer.step()
         if use_wandb:
-            wandb.log({"loss": total_loss.item(), "loss_keypoints": loss_dict['loss_keypoints'],
-                       "loss_boxes": loss_dict['loss_boxes'], "loss_giou": loss_dict['loss_giou'],
-                       "loss_object": loss_dict['loss_object']})
-        metric_logger.update(loss=total_loss.item(), **loss_dict)
+            wandb.log({"loss": total_loss, "loss_keypoints": loss_dict['loss_keypoints'],
+                       "loss_boxes": loss_dict['loss_boxes'], "loss_iou": loss_dict['loss_iou'],
+                       "loss_conf": loss_dict['loss_conf']})
+        metric_logger.update(loss=total_loss, **loss_dict)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
@@ -51,7 +52,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 
 @torch.no_grad()
-def evaluate(model, data_loader, device, keypoint_thresh_list, nms_iou_thresh=0.5,
+def evaluate(model, data_loader, anchor, device, threshold, keypoint_thresh_list, nms_iou_thresh=0.5,
              matching_iou_thresh=0.5, conf_thresh=0.9, save_skeleton=False, save_attention_weight=False):
     model.to(device).eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -63,9 +64,9 @@ def evaluate(model, data_loader, device, keypoint_thresh_list, nms_iou_thresh=0.
     for samples, targets in metric_logger.log_every(data_loader, 10, header):
         samples = samples.to(device)
         outputs = model(samples)
-        outputs = nms(outputs, iou_thresh=nms_iou_thresh)
+        # outputs = nms(outputs, iou_thresh=nms_iou_thresh)
         conf_matched, num_target, skeleton, keypoint_error \
-            = get_batch_statistics(outputs, targets, matching_iou_thresh, conf_thresh, save_skeleton,
+            = get_batch_statistics(outputs, targets, anchor, device, threshold, matching_iou_thresh, conf_thresh, save_skeleton,
                                    save_attention_weight)
         conf_matched_list.append(conf_matched)
         total_num_target += num_target
@@ -101,92 +102,93 @@ def nms(outputs, iou_thresh):
     return outputs
 
 
-def get_batch_statistics(outputs, targets, iou_thresh, conf_thresh, save_skeleton=False,
-                         save_attention_weight=False):
-    matcher = HungarianMatcher(cost_boxes=0, cost_keypoint=0, cost_giou=0, cost_obj=1,
-                               iou_thresh=iou_thresh)
-    indices = matcher(outputs, targets)
-    pred_confidence = outputs['pred_confidence']
-    pred_boxes = outputs['pred_boxes']
-    pred_keypoints = outputs['pred_keypoints']
+def get_batch_statistics(outputs, targets, anchor, device, threshold, iou_thresh, conf_thresh, save_skeleton=False,
+                         save_attention_weight=False, ):
+
+    pred_boxes = outputs[:, :, :, :4]
+    pred_conf = outputs[:, :, :, 4]
+    pred_keypoints = outputs[:, :, :, 5:]
     tgt_boxes = targets['boxes']
     tgt_keypoints = targets['keypoints']
     tgt_label_files = targets['label_files']
     conf_matched = []
     total_num_target = 0
+
+    px, py, pw, ph = transform_bbox(pred_boxes, anchor)
+
+    tgts = get_targets(pred_boxes, targets, anchor, device, threshold)
+    tx = tgts["tx"]
+    ty = tgts["ty"]
+    tw = tgts["tw"]
+    th = tgts["th"]
+    tkey = tgts["tkey"]
+    t_confidence = tgts["t_conf"]
+    obj_mask = tgts["obj_mask"]
+    noobj_mask = tgts["noobj_mask"]
+    tmp_tx = tx[obj_mask]
+    tmp_pbox = pred_boxes[obj_mask]
+
     # extract data for AP computation
-    for i, index in enumerate(indices):
-        conf = pred_confidence[i]
-        matched = torch.zeros_like(conf)
-        matched[index[0]] = 1
-        conf_matched.append(torch.concat((conf, matched), 1))
-        num_target = tgt_boxes[i].shape[0]
-        total_num_target += num_target
-    conf_matched = torch.concat(conf_matched, 0)
+    # for i, index in enumerate(indices):
+    #     conf = pred_confidence[i]
+    #     matched = torch.zeros_like(conf)
+    #     matched[index[0]] = 1
+    #     conf_matched.append(torch.concat((conf, matched), 1))
+    #     num_target = tgt_boxes[i].shape[0]
+    #     total_num_target += num_target
+    # conf_matched = torch.concat(conf_matched, 0)
+
     # extract skeleton and compute keypoint errors
     skeleton = []
     keypoint_error = []
-    for i, index in enumerate(indices):
-        conf = pred_confidence[i, :, 0].cpu().numpy()
-        valid = conf > conf_thresh
-        pbox = pred_boxes[i, valid, :, :].cpu().numpy()
-        pkpt = pred_keypoints[i, valid, :, :].cpu().numpy()
-        tbox = tgt_boxes[i]
-        tkpt = tgt_keypoints[i]
-        pbox_center = pbox[:, 0:1, :] * area_size_xyz + area_min_xyz
-        pbox_size = pbox[:, 1:2, :] * area_size_xyz
+
+    p_conf = pred_conf[obj_mask].cpu().numpy()
+    px = px[obj_mask].cpu().numpy()
+    py = py[obj_mask].cpu().numpy()
+    pw = pw[obj_mask].cpu().numpy()
+    ph = ph[obj_mask].cpu().numpy()
+    pkpt = pred_keypoints[obj_mask].cpu().numpy().reshape(-1, 21, 3)
+
+    tx = tx[obj_mask].cpu().numpy()
+    ty = ty[obj_mask].cpu().numpy()
+    tw = tw[obj_mask].cpu().numpy()
+    th = th[obj_mask].cpu().numpy()
+    tkpt = tkey[obj_mask].cpu().numpy().reshape(-1, 21, 3)
+
+    pbox = np.stack((px, py, pw, ph)).T
+    tbox = np.stack((tx, ty, tw, th)).T
+
+    for i in range(tx.shape[0]):
+        pbox_center = pbox[i, :2] * area_size_xyz[:2] + area_min_xyz[:2]
+        pbox_size = pbox[i, 2:] * area_size_xyz[:2]
         pbox_min = pbox_center - pbox_size / 2
-        pkpt_orig = pkpt * pbox_size + pbox_min
-        tbox_center = tbox[:, 0:1, :] * area_size_xyz + area_min_xyz
-        tbox_size = tbox[:, 1:2, :] * area_size_xyz
+        pkpt_orig = np.zeros(pkpt.shape)
+        pkpt_orig[i][:, :2] = pkpt[i][:, :2] * pbox_size + pbox_min
+        pkpt_orig[i][:, 2] = pkpt[i][:, 2] * area_size_xyz[2]
+
+        tbox_center = tbox[i, :2] * area_size_xyz[:2] + area_min_xyz[:2]
+        tbox_size = tbox[i, 2:] * area_size_xyz[:2]
         tbox_min = tbox_center - tbox_size / 2
-        tkpt_orig = tkpt * tbox_size + tbox_min
-        skeleton.append((pkpt_orig, tkpt_orig))
-        if save_skeleton:
+        tkpt_orig = np.zeros(tkpt.shape)
+        tkpt_orig[i][:, :2] = tkpt[i][:, :2] * tbox_size + tbox_min
+        tkpt_orig[i][:, 2] = tkpt[i][:, 2] * area_size_xyz[2]
+
+        skeleton.append((pkpt_orig[i], tkpt_orig[i]))
+
+    if save_skeleton:
+        for i in range(len(tgt_label_files)):
             save_file = Path(tgt_label_files[i])
             parts = list(save_file.parts)
             parts[-5] = 'predicted_label'
             save_file = Path('').joinpath(*parts)
-            kpt = rearrange(pkpt_orig, 'pr kp c -> (pr kp) c')
             os.makedirs(save_file.parents[0].resolve(), exist_ok=True)
-            np.save(str(save_file), kpt)
-        valid_ind = np.arange(conf.shape[0])[valid]
-        for p_idx, t_idx in zip(index[0].cpu().numpy(), index[1].cpu().numpy()):
-            p_vidx = np.where(valid_ind == p_idx)[0]
-            if p_vidx.size == 1:
-                keypoint_error.append(np.linalg.norm(pkpt_orig[p_vidx[0]] - tkpt_orig[t_idx], axis=1))
+            np.save(str(save_file), skeleton[0][i])
+            keypoint_error.append(np.linalg.norm(skeleton[0][i] - skeleton[1][i], axis=1))
     if len(keypoint_error) > 0:
         keypoint_error = np.stack(keypoint_error, axis=0)
     else:
         keypoint_error = np.empty([0, 21])
-    if save_attention_weight:
-        num_ant_pairs = len(tx_antenna_position) * len(rx_antenna_position)
-        attention_layers = outputs['attention_map']
-        for i, index in enumerate(indices):
-            save_file = Path(tgt_label_files[i])
-            parts = list(save_file.parts)
-            parts[-5] = 'attention_weight'
-            parts[-1] = parts[-1].split('.')[0] + '.png'
-            save_file = Path('').joinpath(*parts)
-            os.makedirs(save_file.parents[0].resolve(), exist_ok=True)
-            if save_file.is_file():
-                save_file.unlink()
-            num_target = index[0].shape[0]
-            if num_target == 0:
-                break
-            num_layer = len(attention_layers)
-            fig = plt.figure(figsize=(4 * num_layer, 5 * num_target))
-            gs = GridSpec(num_target, num_layer)
-            for layer_idx, attention in enumerate(attention_layers):
-                attention = rearrange(attention[i, index[0], :], 't (a s) -> t a s', a=num_ant_pairs)
-                for target_idx, attention_map in enumerate(attention):
-                    ax = fig.add_subplot(gs[target_idx, layer_idx])
-                    ax.set_title(f'Target: {target_idx}, Layer: {layer_idx + 1}')
-                    ax.set_xlabel('Time')
-                    ax.set_ylabel('Antenna pairs')
-                    ax.imshow(attention_map.cpu().numpy())
-            fig.savefig(save_file)
-            plt.close(fig)
+
     return conf_matched, total_num_target, skeleton, keypoint_error
 
 
@@ -226,3 +228,55 @@ def compute_pck(keypoint_error: np.ndarray, threshold_list: List[float]):
         keypoint_pck[threshold] = cond.sum()/num_sample
     return keypoint_pck, per_keypoint_pck, keypoint_cdf, per_keypoint_cdf
 
+
+def get_batch_targets(pred_boxes, target, anchors, device, ignore_thresh):
+    batch_size = pred_boxes.size(0)
+    grid_size = pred_boxes.size(1)
+
+    size_t = batch_size, grid_size, grid_size
+    size_key = batch_size, grid_size, grid_size, 63
+
+    obj_mask = torch.zeros(size_t, device=device, dtype=torch.bool)
+    noobj_mask = torch.ones(size_t, device=device, dtype=torch.bool)
+    tx = torch.zeros(size_t, device=device, dtype=torch.float32)
+    ty = torch.zeros(size_t, device=device, dtype=torch.float32)
+    tw = torch.zeros(size_t, device=device, dtype=torch.float32)
+    th = torch.zeros(size_t, device=device, dtype=torch.float32)
+    tkey = torch.zeros(size_key, device=device, dtype=torch.float32)
+
+    target_boxes = torch.cat([torch.tensor(t.reshape(-1, 6)).float().to(pred_boxes.device) for t in target['boxes']],
+                             dim=0)
+    target_keypoints = torch.cat([torch.tensor(t).float().to(pred_boxes.device) for t in target['keypoints']], dim=0)
+    target_keypoints = target_keypoints.reshape(-1, 63)
+
+    target_xy = target_boxes[:, :2] * grid_size
+    target_wh = target_boxes[:, 3:5] * grid_size
+    t_x, t_y = target_xy.t()
+    t_w, t_h = target_wh.t()
+
+    grid_i, grid_j = target_xy.long().t()
+
+    obj_mask[:, grid_j, grid_i] = 1
+    noobj_mask[:, grid_j, grid_i] = 0
+
+    for i in range(target_boxes.shape[0]):
+        tx[i, grid_j[i], grid_i[i]] = t_x[i] - t_x[i].floor()
+        ty[i, grid_j[i], grid_i][i] = t_y[i] - t_y[i].floor()
+
+        tw[i, grid_j, grid_i] = torch.log(t_w / anchors[0] + 1e-16)
+        th[i, grid_j, grid_i] = torch.log(t_h / anchors[1] + 1e-16)
+        for j in range(target_keypoints.size(1)):
+            tkey[i, grid_j, grid_i, j] = target_keypoints[:, j]
+
+    output = {
+        "obj_mask": obj_mask,
+        "noobj_mask": noobj_mask,
+        "tx": tx,
+        "ty": ty,
+        "tw": tw,
+        "th": th,
+        "tkey": tkey,
+        "t_conf": obj_mask.float(),
+    }
+
+    return output

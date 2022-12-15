@@ -1,61 +1,93 @@
 import torch
-from torchvision.ops.boxes import box_area
 
 
-def box_cxcyczwhd_to_xyzxyz(x):
+def iou(x1, y1, w1, h1, x2, y2, w2, h2):
+    box1_x1 = x1 - w1 / 2
+    box1_y1 = y1 - h1 / 2
+    box1_x2 = x1 + w1 / 2
+    box1_y2 = y1 + h1 / 2
+
+    box2_x1 = x2 - w2 / 2
+    box2_y1 = y2 - h2 / 2
+    box2_x2 = x2 + w2 / 2
+    box2_y2 = y2 + h2 / 2
+
+    x1 = torch.max(box1_x1, box2_x1)
+    y1 = torch.max(box1_y1, box2_y1)
+    x2 = torch.max(box1_x2, box2_x2)
+    y2 = torch.max(box1_y2, box2_y2)
+
+    intersection = (x2 - x1).clamp(0) * (y2 - y1).clamp(0)
+    box1_area = abs((box1_x2 - box1_x1) * (box1_y2 - box1_y1))
+    box2_area = abs((box2_x2 - box2_x1) * (box2_y2 - box2_y1))
+
+    return intersection / (box1_area + box2_area - intersection + 1e-6)
+
+
+def generalized_iou(pr_bboxes, gt_bboxes):
+    """
+    gt_bboxes: tensor (-1, 4) xyxy
+    pr_bboxes: tensor (-1, 4) xyxy
+    loss proposed in the paper of giou
+    """
+    gt_area = (gt_bboxes[:, 2] - gt_bboxes[:, 0]) * (gt_bboxes[:, 3] - gt_bboxes[:, 1])
+    pr_area = (pr_bboxes[:, 2] - pr_bboxes[:, 0]) * (pr_bboxes[:, 3] - pr_bboxes[:, 1])
+
+    # iou
+    lt = torch.max(gt_bboxes[:, :2], pr_bboxes[:, :2])
+    rb = torch.min(gt_bboxes[:, 2:], pr_bboxes[:, 2:])
+    TO_REMOVE = 1
+    wh = (rb - lt + TO_REMOVE).clamp(min=0)
+    inter = wh[:, 0] * wh[:, 1]
+    union = gt_area + pr_area - inter
+    iou = inter / union
+    # enclosure
+    lt = torch.min(gt_bboxes[:, :2], pr_bboxes[:, :2])
+    rb = torch.max(gt_bboxes[:, 2:], pr_bboxes[:, 2:])
+    wh = (rb - lt + TO_REMOVE).clamp(min=0)
+    enclosure = wh[:, 0] * wh[:, 1]
+
+    return iou - (enclosure - union) / enclosure
+
+
+def box_cxcywh_to_xyxy(cx, cy, w, h):
+    new = [(cx - 0.5 * w), (cy - 0.5 * h), (cx + 0.5 * w), (cy + 0.5 * h)]
+    return torch.stack(new, dim=-1)
+
+
+def box_3d_cxcyczwhd_to_xyzxyz(x):
     x_c, y_c, z_c, w, h, d = x.unbind(-1)
     b = [(x_c - 0.5 * w), (y_c - 0.5 * h), (z_c - 0.5 * d),
          (x_c + 0.5 * w), (y_c + 0.5 * h), (z_c + 0.5 * d)]
     return torch.stack(b, dim=-1)
 
 
-def box_xyzxyz_to_cxcyczwhd(x):
+def box_3d_xyzxyz_to_cxcyczwhd(x):
     x0, y0, z0, x1, y1, z1 = x.unbind(-1)
     b = [(x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2,
          (x1 - x0), (y1 - y0), (z1 - z0)]
     return torch.stack(b, dim=-1)
 
 
-def box_cxcywh_to_xyxy(x):
-    x_c, y_c, w, h = x.unbind(-1)
-    b = [(x_c - 0.5 * w), (y_c - 0.5 * h),
-         (x_c + 0.5 * w), (y_c + 0.5 * h)]
-    return torch.stack(b, dim=-1)
+# def box_iou(box1, box2):
+#     area1 = (box1[:, 2] - box1[:, 0]) * (box1[:, 3] - box1[:, 1])
+#     area2 = (box2[:, 2] - box2[:, 0]) * (box2[:, 3] - box2[:, 1])
+#
+#     maxmin = torch.max(box1[:, None, :2], box2[:, :2])
+#     minmax = torch.min(box1[:, None, 2:], box2[:, 2:])
+#
+#     wh =(minmax- maxmin).clamp(min=0)
+#     inter = wh[:]
 
-
-def box_xyxy_to_cxcywh(x):
-    x0, y0, x1, y1 = x.unbind(-1)
-    b = [(x0 + x1) / 2, (y0 + y1) / 2,
-         (x1 - x0), (y1 - y0)]
-    return torch.stack(b, dim=-1)
-
-
-# modified from torchvision to also return the union
-def box_iou(boxes1, boxes2):
-    area1 = box_area(boxes1)
-    area2 = box_area(boxes2)
-
-    lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])  # [N,M,2]
-    rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])  # [N,M,2]
-
-    wh = (rb - lt).clamp(min=0)  # [N,M,2]
-    inter = wh[:, :, 0] * wh[:, :, 1]  # [N,M]
-
-    union = area1[:, None] + area2 - inter
-
-    iou = inter / union
-    return iou, union
-
-
-def volume_iou(boxes1, boxes2):
+def box_3d_iou(boxes1, boxes2):
     volume1 = (boxes1[:, 3] - boxes1[:, 0]) * (boxes1[:, 4] - boxes1[:, 1]) * (boxes1[:, 5] - boxes1[:, 2])
     volume2 = (boxes2[:, 3] - boxes2[:, 0]) * (boxes2[:, 4] - boxes2[:, 1]) * (boxes2[:, 5] - boxes2[:, 2])
 
-    lt = torch.max(boxes1[:, None, :3], boxes2[:, :3])
-    rb = torch.min(boxes1[:, None, 3:], boxes2[:, 3:])
+    maxmin = torch.max(boxes1[:, None, :3], boxes2[:, :3])
+    minmax = torch.min(boxes1[:, None, 3:], boxes2[:, 3:])
 
-    wh = (rb - lt).clamp(min=0)
-    inter = wh[:, :, 0] * wh[:, :, 1] * wh[:, :, 2]
+    wlh = (minmax - maxmin).clamp(min=0)
+    inter = wlh[:, :, 0] * wlh[:, :, 1] * wlh[:, :, 2]
 
     union = volume1[:, None] + volume2 - inter
 
@@ -63,70 +95,23 @@ def volume_iou(boxes1, boxes2):
     return iou, union
 
 
-def generalized_box_iou(boxes1, boxes2):
-    """
-    Generalized IoU from https://giou.stanford.edu/
-    The boxes should be in [x0, y0, x1, y1] format
-    Returns a [N, M] pairwise matrix, where N = len(boxes1)
-    and M = len(boxes2)
-    """
-    # degenerate boxes gives inf / nan results
-    # so do an early check
-    assert (boxes1[:, 2:] >= boxes1[:, :2]).all()
-    assert (boxes2[:, 2:] >= boxes2[:, :2]).all()
-    iou, union = box_iou(boxes1, boxes2)
+def generalized_box_3d_iou(boxes1, boxes2):
+    iou, union = box_3d_iou(boxes1, boxes2)
 
-    lt = torch.min(boxes1[:, None, :2], boxes2[:, :2])
-    rb = torch.max(boxes1[:, None, 2:], boxes2[:, 2:])
+    minmin = torch.min(boxes1[:, None, :3], boxes2[:, :3])
+    maxmax = torch.max(boxes1[:, None, 3:], boxes2[:, 3:])
 
-    wh = (rb - lt).clamp(min=0)  # [N,M,2]
-    area = wh[:, :, 0] * wh[:, :, 1]
-
-    return iou - (area - union) / area
-
-
-def generalized_3d_box_iou(boxes1, boxes2):
-    """
-    Generalized IoU from https://giou.stanford.edu/
-    The boxes should be in [x0, y0, x1, y1] format
-    Returns a [N, M] pairwise matrix, where N = len(boxes1)
-    and M = len(boxes2)
-    """
-    # degenerate boxes gives inf / nan results
-    # so do an early check
-    assert (boxes1[:, 3:] >= boxes1[:, :3]).all()
-    assert (boxes2[:, 3:] >= boxes2[:, :3]).all()
-    iou, union = volume_iou(boxes1, boxes2)
-
-    lt = torch.min(boxes1[:, None, :3], boxes2[:, :3])
-    rb = torch.max(boxes1[:, None, 3:], boxes2[:, 3:])
-
-    wh = (rb - lt).clamp(min=0)  # [N,M,2]
-    volume = wh[:, :, 0] * wh[:, :, 1] * wh[:, :, 2]
+    wlh = (maxmax - minmin).clamp(min=0)
+    volume = wlh[:, :, 0] * wlh[:, :, 1] * wlh[:, :, 2]
 
     return iou - (volume - union) / volume
 
 
-def masks_to_boxes(masks):
-    """Compute the bounding boxes around the provided masks
-    The masks should be in format [N, H, W] where N is the number of masks, (H, W) are the spatial dimensions.
-    Returns a [N, 4] tensors, with the boxes in xyxy format
-    """
-    if masks.numel() == 0:
-        return torch.zeros((0, 4), device=masks.device)
+def get_iou_wh(wh1, wh2):
+    wh2 = wh2.t()
+    w1, h1 = wh1[0], wh1[1]
+    w2, h2 = wh2[0], wh2[1]
+    inter_area = torch.min(w1, w2) * torch.min(h1, h2)
+    union_area = (w1 * h1 + 1e-16) + w2 * h2 - inter_area
 
-    h, w = masks.shape[-2:]
-
-    y = torch.arange(0, h, dtype=torch.float)
-    x = torch.arange(0, w, dtype=torch.float)
-    y, x = torch.meshgrid(y, x)
-
-    x_mask = (masks * x.unsqueeze(0))
-    x_max = x_mask.flatten(1).max(-1)[0]
-    x_min = x_mask.masked_fill(~(masks.bool()), 1e8).flatten(1).min(-1)[0]
-
-    y_mask = (masks * y.unsqueeze(0))
-    y_max = y_mask.flatten(1).max(-1)[0]
-    y_min = y_mask.masked_fill(~(masks.bool()), 1e8).flatten(1).min(-1)[0]
-
-    return torch.stack([x_min, y_min, x_max, y_max], 1)
+    return inter_area / union_area

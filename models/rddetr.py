@@ -1,75 +1,78 @@
 import numpy as np
-import math
-
+from tqdm import tqdm
 import torch
 from torch import nn
-import torch.nn.functional as F
-
-from models.backbone import CNN_layer
+from einops import rearrange
+from models.misc_model import positional_encoding_sine, CNNBackbone, MLP
+from models.transformer import Transformer
+import logging
+from data_processing.dataset import get_dataset_and_dataloader_all
 
 
 class RDDETR(nn.Module):
-    def __init__(self, position_encoding, transformer, num_classes, num_queries, aux_loss=False, device='cuda'):
+    def __init__(self, num_stacked_seqs, d_model, num_queries, n_head, num_layers, dim_feedforward,
+                 dropout, activation):
         super(RDDETR, self).__init__()
+        self.num_stacked_seqs = num_stacked_seqs
+        self.d_model = d_model
         self.num_queries = num_queries
-        self.transformer = transformer
-        self.hidden_dim = transformer.d_model
-        self.backbone = CNN_layer()
-        self.box_head = MLP(input_dim=self.hidden_dim, hidden_dim=self.hidden_dim, output_dim=6, num_layers=3)
-        # self.keypoint_dist_head = MLP(input_dim=self.hidden_dim, hidden_dim=self.hidden_dim,
-        #                               output_dim=3 * 13, num_layers=3)
-        self.keypoint_dist_head = nn.Linear(self.hidden_dim, 3 * 21)
-        # self.keypoint_dist_head = MLP(input_dim=self.hidden_dim, hidden_dim=self.hidden_dim, output_dim=3 * 21,
-        #                               num_layers=3)
-        self.objectness_head = nn.Linear(self.hidden_dim, 1)
-        self.query_embed = nn.Embedding(num_queries, self.hidden_dim)
-        self.positional_encoding = position_encoding
-        self.aux_loss = aux_loss
-        self.device = device
-        self.anchor = torch.tensor([10.0, 10.0, 1.0]).repeat(25, 25, 1, 1).to(self.device)
-        self.num_layers = self.transformer.decoder.num_layers
+        self.n_head = n_head
+        self.num_layers = num_layers
+        self.dim_feedforward = dim_feedforward
+        self.backbone = CNNBackbone(in_channel=num_stacked_seqs, out_channel=d_model)
+        self.transformer = Transformer(d_model=d_model, n_head=n_head, num_layers=num_layers,
+                                       dim_feedforward=dim_feedforward, dropout=dropout,
+                                       activation=activation, return_intermediate=True)
+        self.box_head = MLP(input_dim=self.d_model, hidden_dim=self.d_model, output_dim=6, num_layers=3)
+        self.keypoint_dist_head = nn.Linear(self.d_model, 21 * 3)
+        self.objectness_head = nn.Linear(self.d_model, 1)
+        self.query = nn.Embedding(self.num_queries, self.d_model)
+        self.query_pos_embedding = nn.Embedding(self.num_queries, self.d_model)
+        source_pos = positional_encoding_sine(num_embedding=10000, d_model=d_model, max_num_embedding=10000,
+                                              normalize=False, scale=None)
+        self.register_buffer('source_pos', source_pos)
+        query_zero = torch.zeros(self.num_queries, self.d_model)
+        self.register_buffer('query_zero', query_zero)
 
     def forward(self, inputs):
-        batch_size, tx_antenna_size, rx_antenna_size, sampling_size = inputs.shape
-        flattened_inputs = inputs.view(batch_size, -1, sampling_size)
-        channeled_inputs = flattened_inputs.unsqueeze(1)
-        embedded_inputs = self.backbone(channeled_inputs)
-        embedded_sequence = embedded_inputs.view(batch_size, self.backbone.out_channel, -1)
-        embedded_sequence = embedded_sequence.permute(0, 2, 1)
-        positional_encoding = self.positional_encoding(embedded_sequence)
-        padding_mask = None
-        hidden_state, attention_map = self.transformer(embedded_sequence, padding_mask,
-                                                       self.query_embed.weight, positional_encoding)
-        output_3d_box = self.box_head(hidden_state).sigmoid()
-        output_keypoint_dist = self.keypoint_dist_head(hidden_state).sigmoid()
-        output_confidence = self.objectness_head(hidden_state)
-        prediction = {'pred_keypoints': output_keypoint_dist[-1], 'pred_boxes': output_3d_box[-1],
-                      'attention_map': attention_map, 'pred_confidence': output_confidence[-1]}
-        # if self.aux_loss:
-        #     prediction['aux_outputs'] = self._set_aux_loss(output_keypoint_dist, output_grid_box)
+        x = self.backbone(inputs)
+        x = rearrange(x, 'b c a s -> b (a s) c')
+        source_pos = self.source_pos[:x.shape[1], :]
+        x, attn, intermediate_output, intermediate_attn = self.transformer(self.query_zero, x, self.query_pos_embedding.weight, source_pos)
+        output_3d_box = self.box_head(x).reshape(-1, self.num_queries, 2, 3).sigmoid()
+        output_keypoint_dist = self.keypoint_dist_head(x).reshape(-1, self.num_queries, 21, 3).sigmoid()
+        output_confidence_logit = self.objectness_head(x)
+        output_confidence = output_confidence_logit.sigmoid()
+        prediction = {'pred_keypoints': output_keypoint_dist, 'pred_boxes': output_3d_box,
+                      'attention_map': intermediate_attn + [attn], 'pred_confidence_logit': output_confidence_logit,
+                      'pred_confidence': output_confidence}
         return prediction
 
-    @staticmethod
-    def _make_grid(nx=25, ny=25, nz=1):
-        xv, yv, zv = torch.meshgrid([torch.arange(nx), torch.arange(ny), torch.arange(nz)])
-        return torch.stack((xv, yv, zv), 2).view((nx, ny, nz, 3))
 
-    @torch.jit.unused
-    def _set_aux_loss(self, output_keypoint, output_3d_box):
-        return [{'pred_keypoints': k, 'pred_boxes': b} for k, b in zip(output_keypoint[:-1], output_3d_box[:-1])]
+if __name__ == "__main__":
+    logging.basicConfig(format="%(message)s", level=logging.INFO)
+    num_stacked_seqs = 1
+    d_model = 128
+    num_queries = 100
+    n_head = 8
+    num_layers = 3
+    dim_feedforward = 2048
+    dropout = 0.1
+    activation = 'gelu'
+    device = 'cuda:0'
+    batch_size = 2
+    num_dataset_workers = 4
+    rddetr = RDDETR(num_stacked_seqs, d_model, num_queries, n_head, num_layers, dim_feedforward,
+                    dropout, activation).to(device)
+    dataloader, dataset = get_dataset_and_dataloader_all(batch_size=batch_size, num_workers=num_dataset_workers,
+                                                     num_stacked_seqs=num_stacked_seqs, mode='test')
+    logging.info(f'Parameters: {sum(p.numel() for p in rddetr.parameters() if p.requires_grad)}')
+    iter_per_epoch = int(len(dataset) // batch_size)
+    pbar = tqdm(enumerate(dataloader), total=iter_per_epoch, desc="Testing")
+    for iter, (radar, label) in pbar:
+        prediction = rddetr(radar.to(device))
 
 
-class MLP(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
-        super(MLP, self).__init__()
-        self.num_layers = num_layers
-        h = [hidden_dim] * (num_layers - 1)
-        self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
-
-    def forward(self, x):
-        for i, layer in enumerate(self.layers):
-            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
-        return x
 
 
 

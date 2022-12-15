@@ -1,0 +1,83 @@
+program: train.py
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - ${args}
+method: bayes
+metric:
+  name: combined_metric
+  goal: maximize
+parameters:
+  num_stacked_seqs:
+    min: 1
+    max: 8
+  num_layers:
+    min: 1
+    max: 8
+  dim_feedforward:
+    min: 32
+    max: 2048
+
+#  d_model:
+#    min: 128
+#    max: 128
+#  n_heads:
+#    min: 8
+#    max: 8
+#  num_queries:
+#    min: 150
+#    max: 150
+#
+#
+#  loss_boxes_coef:
+#    min: 1
+#    max: 1
+#  loss_keypoints_coef:
+#    min: 1
+#    max: 1
+#  loss_giou_coef:
+#    min: 5
+#    max: 5
+#  loss_object_coef:
+#    min: 12
+#    max: 12
+#  empty_weight:
+#    min: 300
+#    max: 300
+#
+#  lr:
+#    distribution: constant
+#    value: 1e-4
+#  batch_size:
+#    min: 64
+#    max: 64
+#  weight_decay:
+#    distribution: constant
+#    value: 1e-4
+  epochs:
+    value: 20
+#  lr_drop:
+#    min: 14
+#    max: 14
+#  clip_max_norm:
+#    min: 0.1
+#    max: 0.1
+#  trans_dropout:
+#    min: 0.1
+#    max: 0.1
+#  trans_activation:
+#    values: [ 'relu', 'gelu', 'glu' ]
+#    probabilities: [ 0, 1, 0 ]
+#  matcher_cost_boxes:
+#    min: 1
+#    max: 1
+#  matcher_cost_keypoint:
+#    min: 1
+#    max: 1
+#  matcher_cost_giou:
+#    min: 1
+#    max: 1
+#  matcher_cost_obj:
+#    min: 1
+#    max: 1

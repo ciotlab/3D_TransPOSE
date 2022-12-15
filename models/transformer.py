@@ -1,189 +1,56 @@
 import copy
-from typing import Optional, List
-
-import numpy
-from PIL import Image
-import matplotlib.pyplot as plt
-
+from typing import Optional
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
+import logging
+from einops import rearrange
+from data_processing.dataset import get_dataset_and_dataloader
+from models.misc_model import CNNBackbone, positional_encoding_sine
 
 
 class Transformer(nn.Module):
-    def __init__(self, d_model=512, nhead=8, num_encoder_layers=6,
-                 num_decoder_layers=6, dim_feedforward=2048, dropout=0.1,
-                 activation="relu", normalize_before=False,
-                 return_intermediate_dec=False):
+    def __init__(self, d_model=512, n_head=8, num_layers=6, dim_feedforward=2048, dropout=0.1,
+                 activation="relu", return_intermediate=False):
         super().__init__()
-        # encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
-        #                                         dropout, activation, normalize_before)
-        # encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
-        # self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm)
-        decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward,
-                                                dropout, activation, normalize_before)
-        decoder_norm = nn.LayerNorm(d_model)
-        self.decoder = TransformerDecoder(decoder_layer, num_decoder_layers, decoder_norm,
-                                          return_intermediate=return_intermediate_dec)
-        self._reset_parameters()
         self.d_model = d_model
-        self.nhead = nhead
-        self.memory = None
+        self.n_head = n_head
+        self.num_layers = num_layers
+        layer = TransformerLayer(d_model, n_head, dim_feedforward, dropout, activation)
+        self.layers = _get_clones(layer, num_layers)
+        self.return_intermediate = return_intermediate
+        self._reset_parameters()
 
     def _reset_parameters(self):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, src, mask, query_embed, pos_embed):
-        batch_size, sequence_length, embedding_dim = src.shape
-        src = src.permute(1, 0, 2)
-        pos_embed = pos_embed.permute(1, 0, 2)
-        query_embed = query_embed.unsqueeze(1).repeat(1, batch_size, 1)
+    def forward(self, query, source, query_pos, source_pos):
+        num_batch = source.shape[0]
+        query = query.expand(num_batch, -1, -1)
+        query_pos = query_pos.expand(num_batch, -1, -1)
+        source_pos = source_pos.expand(num_batch, -1, -1)
+        intermediate_output = []
+        intermediate_attn = []
+        x = query
+        attn = torch.empty(0)
+        for i, layer in enumerate(self.layers):
+            x, attn = layer(query=x, source=source, query_pos=query_pos, source_pos=source_pos)
+            if self.return_intermediate and i < len(self.layers)-1:
+                intermediate_output.append(x)
+                intermediate_attn.append(attn)
+        return x, attn, intermediate_output, intermediate_attn
 
-        target = torch.zeros_like(query_embed)
-        # memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
-        hidden_state, attention_map = self.decoder(target, src, memory_key_padding_mask=mask,
-                                                   pos=pos_embed, query_pos=query_embed)
-        return hidden_state.transpose(1, 2), attention_map
 
+class TransformerLayer(nn.Module):
 
-class TransformerEncoder(nn.Module):
-
-    def __init__(self, encoder_layer, num_layers, norm=None):
+    def __init__(self, d_model, n_head, dim_feedforward=2048, dropout=0.1, activation="relu"):
         super().__init__()
-        self.layers = _get_clones(encoder_layer, num_layers)
-        self.num_layers = num_layers
-        self.norm = norm
-
-    def forward(self, src,
-                mask: Optional[Tensor] = None,
-                src_key_padding_mask: Optional[Tensor] = None,
-                pos: Optional[Tensor] = None):
-        output = src
-
-        for layer in self.layers:
-            output = layer(output, src_mask=mask,
-                           src_key_padding_mask=src_key_padding_mask, pos=pos)
-
-        if self.norm is not None:
-            output = self.norm(output)
-
-        return output
-
-
-class TransformerDecoder(nn.Module):
-
-    def __init__(self, decoder_layer, num_layers, norm=None, return_intermediate=False):
-        super().__init__()
-        self.layers = _get_clones(decoder_layer, num_layers)
-        self.num_layers = num_layers
-        self.norm = norm
-        self.return_intermediate = return_intermediate
-
-    def forward(self, tgt, memory,
-                tgt_mask: Optional[Tensor] = None,
-                memory_mask: Optional[Tensor] = None,
-                tgt_key_padding_mask: Optional[Tensor] = None,
-                memory_key_padding_mask: Optional[Tensor] = None,
-                pos: Optional[Tensor] = None,
-                query_pos: Optional[Tensor] = None):
-        output = tgt
-
-        intermediate = []
-        intermediate_map = []
-
-        for layer in self.layers:
-            output, attn = layer(output, memory, tgt_mask=tgt_mask,
-                                 memory_mask=memory_mask,
-                                 tgt_key_padding_mask=tgt_key_padding_mask,
-                                 memory_key_padding_mask=memory_key_padding_mask,
-                                 pos=pos, query_pos=query_pos)
-            if self.return_intermediate:
-                intermediate.append(self.norm(output))
-                intermediate_map.append(attn)
-
-        if self.norm is not None:
-            output = self.norm(output)
-            if self.return_intermediate:
-                intermediate.pop()
-                intermediate.append(output)
-                intermediate_map.pop()
-                intermediate_map.append(attn)
-
-        if self.return_intermediate:
-            return torch.stack(intermediate), torch.stack(intermediate_map)
-
-        return output.unsqueeze(0), attn
-
-
-class TransformerEncoderLayer(nn.Module):
-
-    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
-                 activation="relu", normalize_before=False):
-        super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
-        # Implementation of Feedforward model
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-
-        self.activation = _get_activation_fn(activation)
-        self.normalize_before = normalize_before
-
-    def with_pos_embed(self, tensor, pos: Optional[Tensor]):
-        return tensor if pos is None else tensor + pos
-
-    def forward_post(self,
-                     src,
-                     src_mask: Optional[Tensor] = None,
-                     src_key_padding_mask: Optional[Tensor] = None,
-                     pos: Optional[Tensor] = None):
-        q = k = self.with_pos_embed(src, pos)
-        src2 = self.self_attn(q, k, value=src, attn_mask=src_mask,
-                              key_padding_mask=src_key_padding_mask)[0]
-        src = src + self.dropout1(src2)
-        src = self.norm1(src)
-        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
-        src = src + self.dropout2(src2)
-        src = self.norm2(src)
-        return src
-
-    def forward_pre(self, src,
-                    src_mask: Optional[Tensor] = None,
-                    src_key_padding_mask: Optional[Tensor] = None,
-                    pos: Optional[Tensor] = None):
-        src2 = self.norm1(src)
-        q = k = self.with_pos_embed(src2, pos)
-        src2 = self.self_attn(q, k, value=src2, attn_mask=src_mask,
-                              key_padding_mask=src_key_padding_mask)[0]
-        src = src + self.dropout1(src2)
-        src2 = self.norm2(src)
-        src2 = self.linear2(self.dropout(self.activation(self.linear1(src2))))
-        src = src + self.dropout2(src2)
-        return src
-
-    def forward(self, src,
-                src_mask: Optional[Tensor] = None,
-                src_key_padding_mask: Optional[Tensor] = None,
-                pos: Optional[Tensor] = None):
-        if self.normalize_before:
-            return self.forward_pre(src, src_mask, src_key_padding_mask, pos)
-        return self.forward_post(src, src_mask, src_key_padding_mask, pos)
-
-
-class TransformerDecoderLayer(nn.Module):
-
-    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
-                 activation="relu", normalize_before=False):
-        super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
-        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        # Multihead attention modules
+        self.self_attn = nn.MultiheadAttention(d_model, n_head, batch_first=True, dropout=dropout)
+        self.cross_attn = nn.MultiheadAttention(d_model, n_head, batch_first=True, dropout=dropout)
         # Implementation of Feedforward model
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
@@ -197,80 +64,26 @@ class TransformerDecoderLayer(nn.Module):
         self.dropout3 = nn.Dropout(dropout)
 
         self.activation = _get_activation_fn(activation)
-        self.normalize_before = normalize_before
 
-    def with_pos_embed(self, tensor, pos: Optional[Tensor]):
+    @staticmethod
+    def with_pos_embed(tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
 
-    def forward_post(self, tgt, memory,
-                     tgt_mask: Optional[Tensor] = None,
-                     memory_mask: Optional[Tensor] = None,
-                     tgt_key_padding_mask: Optional[Tensor] = None,
-                     memory_key_padding_mask: Optional[Tensor] = None,
-                     pos: Optional[Tensor] = None,
-                     query_pos: Optional[Tensor] = None):
-        # seq_len, c, embedding_dim = memory.shape
-        # memory = torch.zeros(seq_len, c, embedding_dim).to('cuda')
-
-        q = k = self.with_pos_embed(tgt, query_pos)
-        tgt2, self_attention_map = self.self_attn(q, k, value=tgt, attn_mask=tgt_mask,
-                                                  key_padding_mask=tgt_key_padding_mask)
-        tgt = tgt + self.dropout1(tgt2)
-        tgt = self.norm1(tgt)
-        tgt2, attention_map = self.multihead_attn(query=self.with_pos_embed(tgt, query_pos),
-                                                  key=self.with_pos_embed(memory, pos),
-                                                  value=memory, attn_mask=memory_mask,
-                                                  key_padding_mask=memory_key_padding_mask)
-        # attention_map = numpy.array(attention_map.squeeze(0).cpu().detach())
-        # attention_norm = (attention_map - numpy.min(attention_map)) / (numpy.max(attention_map) - numpy.min(attention_map))
-        # attention_norm = numpy.linalg.norm(attention_map)
-        # attention_map = attention_norm * 255
-        # grid_attention = attention_map[1].reshape(64, 62)
-        # attention_map = attention_map * 255
-        # attention_image = Image.fromarray(grid_attention)
-        # attention_image.show()
-        tgt = tgt + self.dropout2(tgt2)
-        tgt = self.norm2(tgt)
-        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
-        tgt = tgt + self.dropout3(tgt2)
-        tgt = self.norm3(tgt)
-        return tgt, attention_map
-
-    def forward_pre(self, tgt, memory,
-                    tgt_mask: Optional[Tensor] = None,
-                    memory_mask: Optional[Tensor] = None,
-                    tgt_key_padding_mask: Optional[Tensor] = None,
-                    memory_key_padding_mask: Optional[Tensor] = None,
-                    pos: Optional[Tensor] = None,
-                    query_pos: Optional[Tensor] = None):
-        tgt2 = self.norm1(tgt)
-        q = k = self.with_pos_embed(tgt2, query_pos)
-        tgt2 = self.self_attn(q, k, value=tgt2, attn_mask=tgt_mask,
-                              key_padding_mask=tgt_key_padding_mask)[0]
-        tgt = tgt + self.dropout1(tgt2)
-        tgt2 = self.norm2(tgt)
-        tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt2, query_pos),
-                                   key=self.with_pos_embed(memory, pos),
-                                   value=memory, attn_mask=memory_mask,
-                                   key_padding_mask=memory_key_padding_mask)[0]
-        tgt = tgt + self.dropout2(tgt2)
-        tgt2 = self.norm3(tgt)
-        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
-        tgt = tgt + self.dropout3(tgt2)
-        return tgt
-
-    def forward(self, tgt, memory,
-                tgt_mask: Optional[Tensor] = None,
-                memory_mask: Optional[Tensor] = None,
-                tgt_key_padding_mask: Optional[Tensor] = None,
-                memory_key_padding_mask: Optional[Tensor] = None,
-                pos: Optional[Tensor] = None,
-                query_pos: Optional[Tensor] = None):
-        if self.normalize_before:
-            return self.forward_pre(tgt, memory, tgt_mask, memory_mask,
-                                    tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
-        return self.forward_post(tgt, memory, tgt_mask, memory_mask,
-                                 tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
+    def forward(self, query, source, query_pos, source_pos):
+        x = query
+        q = k = self.with_pos_embed(x, query_pos)
+        x2, self_attn_map = self.self_attn(query=q, key=k, value=x)
+        x = x + self.dropout1(x2)
+        x = self.norm1(x)
+        x2, cross_attn_map = self.cross_attn(query=self.with_pos_embed(x, query_pos),
+                                             key=self.with_pos_embed(source, source_pos),
+                                             value=source)
+        x = x + self.dropout2(x2)
+        x = self.norm2(x)
+        x2 = self.linear2(self.dropout(self.activation(self.linear1(x))))
+        x = x + self.dropout3(x2)
+        x = self.norm3(x)
+        return x, cross_attn_map
 
 
 def _get_clones(module, N):
@@ -285,4 +98,27 @@ def _get_activation_fn(activation):
         return F.gelu
     if activation == "glu":
         return F.glu
-    raise RuntimeError(F"activation should be relu/gelu, not {activation}.")
+    raise RuntimeError(F"activation should be relu/gelu/glu, not {activation}.")
+
+
+if __name__ == "__main__":
+    logging.basicConfig(format="%(message)s", level=logging.INFO)
+    num_stacked_seqs = 4
+    d_model = 128
+    num_queries = 200
+    max_num_embedding = 10000
+    cnn = CNNBackbone(in_channel=num_stacked_seqs).float()
+    transformer = Transformer(d_model=d_model, n_head=8, num_layers=3, dim_feedforward=2048, dropout=0.1,
+                              activation="gelu", return_intermediate=True).float()
+    dataloader, dataset = get_dataset_and_dataloader(batch_size=16, num_workers=0, num_stacked_seqs=num_stacked_seqs, mode='test')
+    data_it = iter(dataloader)
+    radar, label = next(data_it)
+    source = cnn(radar)
+    source = rearrange(source, 'b c a s -> b (a s) c')
+    num_source_embedding = source.shape[1]
+    source_pos = positional_encoding_sine(max_num_embedding, d_model, max_num_embedding, False, None)
+    source_pos = source_pos[:source.shape[1], :]
+    query = torch.zeros(num_queries, d_model)
+    query_pos_embedding = nn.Embedding(num_queries, d_model)
+    output, attn, intermediate_output, intermediate_attn = transformer(query, source, query_pos_embedding.weight, source_pos)
+    pass
