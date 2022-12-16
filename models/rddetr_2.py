@@ -7,6 +7,7 @@ from models.transformer import Transformer
 import logging
 from data_processing.dataset import get_dataset_and_dataloader_all
 from models.backbone import resnet18
+from einops import rearrange, repeat
 
 
 class RDDETR_2(nn.Module):
@@ -20,47 +21,34 @@ class RDDETR_2(nn.Module):
         self.device = device
 
     def forward(self, inputs):
-        x = self.backbone(inputs)
-        # x = repeat(x, 'b (x y s) -> b x y s', x=7, y=7, s=68)
+        # transform signal shape to virtual array
+        x = repeat(inputs, 'b f (t r) s -> (b f) t r s', t=8, r=8)
+        inputs1 = x[:, 0:4, 4:8, :].clone().detach()
+        inputs2 = x[:, 4:8, 0:4, :].clone().detach()
+        x[:, 0:4, 4:8, :] = inputs2
+        x[:, 4:8, 0:4, :] = inputs1
+        x = rearrange(x, 'b t r s -> b r t s')
+        
+        # backbone
+        x = self.backbone(x)
         batch_size = x.size(0)
         grid_size = x.size(2)
-
-        prediction = x.view(batch_size, self.num_anchors, 5 + self.num_keypoints, grid_size, grid_size)
-        prediction = prediction.permute(0, 1, 3, 4, 2).contiguous()
+        
+        prediction = x.view(batch_size, 5 + self.num_keypoints, grid_size, grid_size)
+        prediction = prediction.permute(0, 2, 3, 1).contiguous()
+        
+        # prediction : ( bs, grid_size, grid_size, 68 )
+        x, y = torch.sigmoid(prediction[..., 0]), torch.sigmoid(prediction[..., 1])
+        w, h = torch.exp(prediction[..., 2]), torch.exp(prediction[..., 3])
+        pred_boxes = torch.stack((x, y, w, h), -1)
         obj_score = torch.sigmoid(prediction[..., 4])
         pred_keypoint = torch.sigmoid(prediction[..., 5:])
-
-        self.compute_grid_offsets(grid_size)
-        pred_boxes = self.transform_outputs(prediction)
 
         output = torch.cat((pred_boxes.view(batch_size, grid_size, grid_size, 4),
                             obj_score.view(batch_size, grid_size, grid_size, 1),
                             pred_keypoint.view(batch_size, grid_size, grid_size, self.num_keypoints)), -1)
 
         return output
-
-    def compute_grid_offsets(self, grid_size):
-        self.grid_size = grid_size
-        self.stride = self.anchors[0] / self.grid_size
-        self.grid_x = torch.arange(grid_size).repeat(1, 1, grid_size, 1).type(torch.float32).to(self.device)
-        self.grid_y = torch.arange(grid_size).repeat(1, 1, grid_size, 1).transpose(3, 2).type(torch.float32).to(self.device)
-
-        scaled_anchors = self.anchors[0] / self.stride, self.anchors[0] / self.stride
-        self.scaled_anchors = torch.tensor(scaled_anchors, device=self.device)
-        self.anchor_w = self.scaled_anchors[0].view(1, 1, 1, 1)
-        self.anchor_h = self.scaled_anchors[1].view(1, 1, 1, 1)
-
-    def transform_outputs(self, prediction):
-        x, y = torch.sigmoid(prediction[..., 0]), torch.sigmoid(prediction[..., 1])
-        w, h = prediction[..., 2], prediction[..., 3]
-
-        pred_boxes = torch.zeros_like(prediction[..., :4]).to(self.device)
-        pred_boxes[..., 0] = x.data + self.grid_x
-        pred_boxes[..., 1] = y.data + self.grid_y
-        pred_boxes[..., 2] = torch.exp(w.data) * self.anchor_w
-        pred_boxes[..., 3] = torch.exp(h.data) * self.anchor_h
-
-        return pred_boxes * self.stride
 
 
 if __name__ == "__main__":
