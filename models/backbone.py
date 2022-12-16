@@ -9,9 +9,9 @@ def conv3x3(in_planes: int, out_planes: int, stride: int = 1, groups: int = 1, d
     return nn.Conv2d(
         in_planes,
         out_planes,
-        kernel_size=(1, 3),
+        kernel_size=(3, 3),
         stride=stride,
-        padding=(0, dilation),
+        padding=(1, dilation),
         groups=groups,
         bias=False,
         dilation=dilation,
@@ -147,18 +147,18 @@ class ResNet(nn.Module):
             )
         self.groups = groups
         self.base_width = width_per_group
-        self.conv1 = nn.Conv2d(8, self.inplanes, kernel_size=(1, 2), stride=(1, 2), bias=False)
+        self.conv1 = nn.Conv2d(8, self.inplanes, kernel_size=(3, 8), stride=(1, 4), padding=(1, 1), bias=False)
         self.bn1 = norm_layer(self.inplanes)
         self.relu = nn.Tanh()
-        self.maxpool = nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2))
+        self.maxpool = nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 1))
         # self.layer1 = self._make_layer(block, 12, layers[0])
         # self.layer2 = self._make_layer(block, 30, layers[1], stride=(1, 2), dilate=replace_stride_with_dilation[0])
         # self.layer3 = self._make_layer(block, 45, layers[2], stride=(1, 2), dilate=replace_stride_with_dilation[1])
         # self.layer4 = self._make_layer(block, 68, layers[3], stride=(1, 2), dilate=replace_stride_with_dilation[2])
 
-        self.layer1 = self._make_layer(block, 16, layers[0])
+        self.layer1 = self._make_layer(block, 16, layers[0], stride=(1, 2))
         self.layer2 = self._make_layer(block, 32, layers[1], stride=(1, 4), dilate=replace_stride_with_dilation[0])
-        self.layer3 = self._make_layer(block, 64, layers[2], stride=(1, 4), dilate=replace_stride_with_dilation[1])
+        self.layer3 = self._make_layer(block, 64, layers[2], stride=(1, 2), dilate=replace_stride_with_dilation[1])
         self.layer4 = self._make_layer(block, 68, layers[3], stride=(1, 2), dilate=replace_stride_with_dilation[2])
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(512 * block.expansion, 1)
@@ -220,16 +220,10 @@ class ResNet(nn.Module):
 
     def _forward_impl(self, x: Tensor) -> Tensor:
         # See note [TorchScript super()]
-        x = repeat(x, 'b f (t r) s -> (b f) t r s', t=8, r=8)
-        inputs1 = x[:, 0:4, 4:8, :].clone().detach()
-        inputs2 = x[:, 4:8, 0:4, :].clone().detach()
-        x[:, 0:4, 4:8, :] = inputs2
-        x[:, 4:8, 0:4, :] = inputs1
-        x = rearrange(x, 'b t r s -> b r t s')
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
-        x = self.maxpool(x)
+        # x = self.maxpool(x)
 
         x = self.layer1(x)
         x = self.layer2(x)
