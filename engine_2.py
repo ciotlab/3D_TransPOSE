@@ -1,4 +1,5 @@
 from typing import Iterable, Dict, List
+import numpy
 import numpy as np
 from pathlib import Path
 import os
@@ -11,15 +12,15 @@ from matplotlib.gridspec import GridSpec
 from einops import rearrange
 
 import util.misc as utils
-from models.criterion_2 import get_targets, transform_bbox
-from util.box_ops import box_3d_cxcyczwhd_to_xyzxyz, box_3d_iou
+from models.criterion_2 import get_targets
+from util.box_ops import box_3d_cxcyczwhd_to_xyzxyz, box_3d_iou, iou, iou_eval
 from models.matcher import HungarianMatcher
 from data_processing.dataset import area_min_xyz, area_size_xyz
 from data_processing.dataset_visualization import tx_antenna_position, rx_antenna_position
 
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
-                    data_loader: Iterable, optimizer: torch.optim.Optimizer,
+                    data_loader: Iterable, weight_dict: Dict, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0, use_wandb=False):
     model.train()
     criterion.train()
@@ -32,7 +33,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         samples = samples.to(device)
         outputs = model(samples)
         loss_dict = criterion(outputs, targets)
-        total_loss = sum(loss_dict[k] for k in loss_dict.keys())
+        total_loss = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
 
         optimizer.zero_grad()
         total_loss.backward()
@@ -40,10 +41,12 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
         optimizer.step()
         if use_wandb:
-            wandb.log({"loss": total_loss, "loss_keypoints": loss_dict['loss_keypoints'],
-                       "loss_boxes": loss_dict['loss_boxes'], "loss_iou": loss_dict['loss_iou'],
-                       "loss_conf": loss_dict['loss_conf']})
-        metric_logger.update(loss=total_loss, **loss_dict)
+            wandb.log({"loss": total_loss.item(),
+                       "loss_boxes": loss_dict['loss_boxes'],
+                       "loss_keypoints": loss_dict['loss_keypoints'],
+                       "loss_conf": loss_dict['loss_conf'],
+                       "loss_iou": loss_dict['loss_iou']})
+        metric_logger.update(loss=total_loss.item(), **loss_dict)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
@@ -65,16 +68,15 @@ def evaluate(model, data_loader, anchor, device, threshold, keypoint_thresh_list
         samples = samples.to(device)
         outputs = model(samples)
         # outputs = nms(outputs, iou_thresh=nms_iou_thresh)
-        conf_matched, num_target, skeleton, keypoint_error \
-            = get_batch_statistics(outputs, targets, anchor, device, threshold, matching_iou_thresh, conf_thresh, save_skeleton,
+        tp, num_target, skeleton, keypoint_error \
+            = get_batch_statistics(outputs, targets, anchor, device, threshold, matching_iou_thresh, conf_thresh,
+                                   save_skeleton,
                                    save_attention_weight)
-        conf_matched_list.append(conf_matched)
+        conf_matched_list = conf_matched_list + tp
         total_num_target += num_target
         skeleton_list.extend(skeleton)
         keypoint_error_list.append(keypoint_error)
-    conf_matched = torch.concat(conf_matched_list, dim=0)
-    conf_matched = conf_matched.cpu().numpy()
-    ap, pr_curve = compute_ap(conf_matched, total_num_target)
+    ap, pr_curve = compute_ap(conf_matched_list, total_num_target)
     keypoint_error = np.concatenate(keypoint_error_list, axis=0)
     keypoint_pck, per_keypoint_pck, keypoint_cdf, per_keypoint_cdf \
         = compute_pck(keypoint_error, keypoint_thresh_list)
@@ -96,7 +98,7 @@ def nms(outputs, iou_thresh):
         for idx, conf in enumerate(out_confidence):
             if conf > 0:
                 zero_idx = torch.full_like(out_confidence, False, dtype=torch.bool)
-                zero_idx[idx+1:] = overlap[idx, idx+1:]
+                zero_idx[idx + 1:] = overlap[idx, idx + 1:]
                 out_confidence[zero_idx] = 0
         outputs['pred_confidence'][b, sort_idx, 0] = out_confidence
     return outputs
@@ -104,19 +106,22 @@ def nms(outputs, iou_thresh):
 
 def get_batch_statistics(outputs, targets, anchor, device, threshold, iou_thresh, conf_thresh, save_skeleton=False,
                          save_attention_weight=False, ):
-
-    pred_boxes = outputs[:, :, :, :4]
+    batch_size = outputs.size(0)
+    grid_size = outputs.size(1)
+    px = outputs[:, :, :, 0]
+    py = outputs[:, :, :, 1]
+    pw = outputs[:, :, :, 2]
+    ph = outputs[:, :, :, 3]
     pred_conf = outputs[:, :, :, 4]
     pred_keypoints = outputs[:, :, :, 5:]
+
     tgt_boxes = targets['boxes']
     tgt_keypoints = targets['keypoints']
     tgt_label_files = targets['label_files']
-    conf_matched = []
     total_num_target = 0
+    concat_tp = []
 
-    px, py, pw, ph = transform_bbox(pred_boxes, anchor)
-
-    tgts = get_targets(pred_boxes, targets, anchor, device, threshold)
+    tgts = get_targets(pred_conf, targets, device)
     tx = tgts["tx"]
     ty = tgts["ty"]
     tw = tgts["tw"]
@@ -124,79 +129,93 @@ def get_batch_statistics(outputs, targets, anchor, device, threshold, iou_thresh
     tkey = tgts["tkey"]
     t_confidence = tgts["t_conf"]
     obj_mask = tgts["obj_mask"]
-    noobj_mask = tgts["noobj_mask"]
-    tmp_tx = tx[obj_mask]
-    tmp_pbox = pred_boxes[obj_mask]
-
-    # extract data for AP computation
-    # for i, index in enumerate(indices):
-    #     conf = pred_confidence[i]
-    #     matched = torch.zeros_like(conf)
-    #     matched[index[0]] = 1
-    #     conf_matched.append(torch.concat((conf, matched), 1))
-    #     num_target = tgt_boxes[i].shape[0]
-    #     total_num_target += num_target
-    # conf_matched = torch.concat(conf_matched, 0)
 
     # extract skeleton and compute keypoint errors
     skeleton = []
     keypoint_error = []
 
-    p_conf = pred_conf[obj_mask].cpu().numpy()
-    px = px[obj_mask].cpu().numpy()
-    py = py[obj_mask].cpu().numpy()
-    pw = pw[obj_mask].cpu().numpy()
-    ph = ph[obj_mask].cpu().numpy()
-    pkpt = pred_keypoints[obj_mask].cpu().numpy().reshape(-1, 21, 3)
+    for bs in range(batch_size):
+        target_boxes = torch.tensor(targets['boxes'][bs].reshape(-1, 6)).float().to(pred_conf.device)
+        target_keypoints = torch.tensor(targets['keypoints'][bs].reshape(-1, 63)).float().to(pred_conf.device)
+        target_xy = target_boxes[:, :2] * grid_size
+        target_wh = target_boxes[:, 3:5] * grid_size
 
-    tx = tx[obj_mask].cpu().numpy()
-    ty = ty[obj_mask].cpu().numpy()
-    tw = tw[obj_mask].cpu().numpy()
-    th = th[obj_mask].cpu().numpy()
-    tkpt = tkey[obj_mask].cpu().numpy().reshape(-1, 21, 3)
+        grid_i, grid_j = target_xy.long().t()
 
-    pbox = np.stack((px, py, pw, ph)).T
-    tbox = np.stack((tx, ty, tw, th)).T
+        p_conf = pred_conf[bs][obj_mask[bs]].cpu().numpy()
+        p_x = px[bs][obj_mask[bs]].cpu().numpy()
+        p_y = py[bs][obj_mask[bs]].cpu().numpy()
+        p_w = pw[bs][obj_mask[bs]].cpu().numpy()
+        p_h = ph[bs][obj_mask[bs]].cpu().numpy()
+        pkpt = pred_keypoints[bs][obj_mask[bs]].cpu().numpy().reshape(-1, 21, 3)
 
-    for i in range(tx.shape[0]):
-        pbox_center = pbox[i, :2] * area_size_xyz[:2] + area_min_xyz[:2]
-        pbox_size = pbox[i, 2:] * area_size_xyz[:2]
+        t_x = tx[bs][obj_mask[bs]].cpu().numpy()
+        t_y = ty[bs][obj_mask[bs]].cpu().numpy()
+        t_w = tw[bs][obj_mask[bs]].cpu().numpy()
+        t_h = th[bs][obj_mask[bs]].cpu().numpy()
+        tkpt = tkey[bs][obj_mask[bs]].cpu().numpy().reshape(-1, 21, 3)
+
+        pbox = np.stack((p_x, p_y, p_w, p_h)).T
+        tbox = np.stack((t_x, t_y, t_w, t_h)).T
+
+        pbox_center = pbox[:, :2] * area_size_xyz[:2] + area_min_xyz[:2]
+        pbox_size = pbox[:, 2:] * area_size_xyz[:2]
         pbox_min = pbox_center - pbox_size / 2
         pkpt_orig = np.zeros(pkpt.shape)
-        pkpt_orig[i][:, :2] = pkpt[i][:, :2] * pbox_size + pbox_min
-        pkpt_orig[i][:, 2] = pkpt[i][:, 2] * area_size_xyz[2]
 
-        tbox_center = tbox[i, :2] * area_size_xyz[:2] + area_min_xyz[:2]
-        tbox_size = tbox[i, 2:] * area_size_xyz[:2]
+        tbox_center = tbox[:, :2] * area_size_xyz[:2] + area_min_xyz[:2]
+        tbox_size = tbox[:, 2:] * area_size_xyz[:2]
         tbox_min = tbox_center - tbox_size / 2
         tkpt_orig = np.zeros(tkpt.shape)
-        tkpt_orig[i][:, :2] = tkpt[i][:, :2] * tbox_size + tbox_min
-        tkpt_orig[i][:, 2] = tkpt[i][:, 2] * area_size_xyz[2]
 
-        skeleton.append((pkpt_orig[i], tkpt_orig[i]))
+        for i in range(tkpt.shape[0]):
 
-    if save_skeleton:
-        for i in range(len(tgt_label_files)):
-            save_file = Path(tgt_label_files[i])
+            # count number of target
+            total_num_target += 1
+
+            p_x[i] += grid_i[i].cpu().numpy()
+            p_y[i] += grid_j[i].cpu().numpy()
+            p_w[i] = numpy.exp(p_w[i]) * anchor[0].cpu().numpy()
+            p_h[i] = numpy.exp(p_h[i]) * anchor[1].cpu().numpy()
+
+            pkpt_orig[i][:, :2] = pkpt[i][:, :2] * pbox_size[i] + pbox_min[i]
+            pkpt_orig[i][:, 2] = pkpt[i][:, 2] * area_size_xyz[2]
+
+            tkpt_orig[i][:, :2] = tkpt[i][:, :2] * tbox_size[i] + tbox_min[i]
+            tkpt_orig[i][:, 2] = tkpt[i][:, 2] * area_size_xyz[2]
+
+            box_iou = iou_eval(p_x[i], p_y[i], p_w[i], p_h[i], t_x[i], t_y[i], t_w[i], t_h[i])
+            # print('box_iou : ', box_iou, " p_conf : ", p_conf[i])
+
+            if (box_iou >= iou_thresh) & (p_conf[i] >= conf_thresh):
+                concat_tp.append(1)
+            else:
+                concat_tp.append(0)
+
+        skeleton.append((pkpt_orig, tkpt_orig))
+
+        if save_skeleton:
+            save_file = Path(tgt_label_files[bs])
             parts = list(save_file.parts)
             parts[-5] = 'predicted_label'
             save_file = Path('').joinpath(*parts)
+            kpt = rearrange(pkpt_orig, 'pr kp c -> (pr kp) c')
             os.makedirs(save_file.parents[0].resolve(), exist_ok=True)
-            np.save(str(save_file), skeleton[0][i])
-            keypoint_error.append(np.linalg.norm(skeleton[0][i] - skeleton[1][i], axis=1))
+            np.save(str(save_file), kpt)
+
+        for i in range(tkpt.shape[0]):
+            keypoint_error.append(np.linalg.norm(pkpt_orig[i] - tkpt_orig[i], axis=1))
     if len(keypoint_error) > 0:
         keypoint_error = np.stack(keypoint_error, axis=0)
     else:
         keypoint_error = np.empty([0, 21])
 
-    return conf_matched, total_num_target, skeleton, keypoint_error
+    return concat_tp, total_num_target, skeleton, keypoint_error
 
 
 def compute_ap(conf_matched, total_num_target):
-    sort_idx = np.argsort(conf_matched[:, 0])
-    matched = np.flip(conf_matched[sort_idx, 1])
-    matched_cum = np.cumsum(matched)
-    precision = matched_cum / np.arange(1, len(matched_cum)+1)
+    matched_cum = np.cumsum(conf_matched)
+    precision = matched_cum / np.arange(1, len(matched_cum) + 1)
     recall = matched_cum / total_num_target
     ap = 0
     prev_p = 0
@@ -212,71 +231,18 @@ def compute_ap(conf_matched, total_num_target):
 def compute_pck(keypoint_error: np.ndarray, threshold_list: List[float]):
     sorted_err = np.sort(keypoint_error, axis=0).transpose()
     num_sample = sorted_err.shape[1]
-    prob = np.broadcast_to(np.arange(1, num_sample+1)/num_sample, shape=sorted_err.shape)
+    prob = np.broadcast_to(np.arange(1, num_sample + 1) / num_sample, shape=sorted_err.shape)
     per_keypoint_cdf = np.stack((sorted_err, prob), axis=2)
     sorted_err = np.sort(keypoint_error, axis=None)
     num_sample = sorted_err.shape[0]
-    prob = np.arange(1, num_sample+1)/num_sample
+    prob = np.arange(1, num_sample + 1) / num_sample
     keypoint_cdf = np.stack((sorted_err, prob), axis=1)
     per_keypoint_pck = {}
     keypoint_pck = {}
     for threshold in threshold_list:
         cond = np.float32(keypoint_error < threshold)
         num_sample = cond.shape[0]
-        per_keypoint_pck[threshold] = cond.sum(axis=0)/num_sample
+        per_keypoint_pck[threshold] = cond.sum(axis=0) / num_sample
         num_sample = cond.size
-        keypoint_pck[threshold] = cond.sum()/num_sample
+        keypoint_pck[threshold] = cond.sum() / num_sample
     return keypoint_pck, per_keypoint_pck, keypoint_cdf, per_keypoint_cdf
-
-
-def get_batch_targets(pred_boxes, target, anchors, device, ignore_thresh):
-    batch_size = pred_boxes.size(0)
-    grid_size = pred_boxes.size(1)
-
-    size_t = batch_size, grid_size, grid_size
-    size_key = batch_size, grid_size, grid_size, 63
-
-    obj_mask = torch.zeros(size_t, device=device, dtype=torch.bool)
-    noobj_mask = torch.ones(size_t, device=device, dtype=torch.bool)
-    tx = torch.zeros(size_t, device=device, dtype=torch.float32)
-    ty = torch.zeros(size_t, device=device, dtype=torch.float32)
-    tw = torch.zeros(size_t, device=device, dtype=torch.float32)
-    th = torch.zeros(size_t, device=device, dtype=torch.float32)
-    tkey = torch.zeros(size_key, device=device, dtype=torch.float32)
-
-    target_boxes = torch.cat([torch.tensor(t.reshape(-1, 6)).float().to(pred_boxes.device) for t in target['boxes']],
-                             dim=0)
-    target_keypoints = torch.cat([torch.tensor(t).float().to(pred_boxes.device) for t in target['keypoints']], dim=0)
-    target_keypoints = target_keypoints.reshape(-1, 63)
-
-    target_xy = target_boxes[:, :2] * grid_size
-    target_wh = target_boxes[:, 3:5] * grid_size
-    t_x, t_y = target_xy.t()
-    t_w, t_h = target_wh.t()
-
-    grid_i, grid_j = target_xy.long().t()
-
-    obj_mask[:, grid_j, grid_i] = 1
-    noobj_mask[:, grid_j, grid_i] = 0
-
-    for i in range(target_boxes.shape[0]):
-        tx[i, grid_j[i], grid_i[i]] = t_x[i] - t_x[i].floor()
-        ty[i, grid_j[i], grid_i][i] = t_y[i] - t_y[i].floor()
-
-        tw[i, grid_j, grid_i] = torch.log(t_w / anchors[0] + 1e-16)
-        th[i, grid_j, grid_i] = torch.log(t_h / anchors[1] + 1e-16)
-        for j in range(target_keypoints.size(1)):
-            tkey[i, grid_j, grid_i, j] = target_keypoints[:, j]
-
-    output = {
-        "obj_mask": obj_mask,
-        "noobj_mask": noobj_mask,
-        "tx": tx,
-        "ty": ty,
-        "tw": tw,
-        "th": th,
-        "tkey": tkey,
-        "t_conf": obj_mask.float(),
-    }
-
-    return output
