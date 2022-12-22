@@ -4,6 +4,7 @@ import torch.nn as nn
 from torch import Tensor
 from einops import rearrange, repeat
 
+
 def conv3x3(in_planes: int, out_planes: int, stride: int = 1, groups: int = 1, dilation: int = 1) -> nn.Conv2d:
     """3x3 convolution with padding"""
     return nn.Conv2d(
@@ -159,7 +160,7 @@ class ResNet(nn.Module):
         self.layer1 = self._make_layer(block, 16, layers[0], stride=(1, 2))
         self.layer2 = self._make_layer(block, 32, layers[1], stride=(1, 4), dilate=replace_stride_with_dilation[0])
         self.layer3 = self._make_layer(block, 64, layers[2], stride=(1, 2), dilate=replace_stride_with_dilation[1])
-        self.layer4 = self._make_layer(block, 68, layers[3], stride=(1, 2), dilate=replace_stride_with_dilation[2])
+        self.layer4 = self._make_layer(block, 70, layers[3], stride=(1, 2), dilate=replace_stride_with_dilation[2])
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(512 * block.expansion, 1)
         self.softmax = nn.Softmax()
@@ -253,4 +254,8 @@ def resnet18(**kwargs: Any) -> ResNet:
 
 
 def resnet34(**kwargs: Any) -> ResNet:
+    return _resnet(BasicBlock, [3, 4, 6, 3], **kwargs)
+
+
+def resnet50(**kwargs: Any) -> ResNet:
     return _resnet(BasicBlock, [3, 4, 6, 3], **kwargs)
