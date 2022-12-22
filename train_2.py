@@ -33,26 +33,25 @@ def get_args_parser():
     parser.add_argument('--clip_max_norm', default=0.1, type=float)
 
     parser.add_argument('--num_stacked_seqs', default=1, type=int)
-    parser.add_argument('--anchor', default=3, type=int)
+    parser.add_argument('--anchor', default=2, type=int)
     parser.add_argument('--grid_size', default=8, type=int)
-    parser.add_argument('--threshold', default=0.5, type=float)
 
-    parser.add_argument('--loss_boxes_coef', default=10, type=float)
+    parser.add_argument('--loss_boxes_coef', default=3, type=float)
     parser.add_argument('--loss_keypoints_coef', default=1, type=float)
-    parser.add_argument('--loss_iou_coef', default=25, type=float)
-    parser.add_argument('--loss_object_coef', default=3, type=float)
-    parser.add_argument('--empty_weight', default=60, type=float)
+    parser.add_argument('--loss_iou_coef', default=5, type=float)
+    parser.add_argument('--loss_object_coef', default=10, type=float)
+    parser.add_argument('--empty_weight', default=200, type=float)
 
     parser.add_argument('--val_keypoint_thresh_list', default="0.05, 0.1, 0.2, 0.3, 0.4, 0.5", type=str)
     parser.add_argument('--val_nms_iou_thresh', default=0.5, type=float)
     parser.add_argument('--val_matching_iou_thresh', default=0.5, type=float)
-    parser.add_argument('--val_conf_thresh', default=0.8, type=float)
+    parser.add_argument('--val_conf_thresh', default=0.9, type=float)
 
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--seed', default=42, type=int)
 
     parser.add_argument('--model_file_name', default='saved_model.pt', type=str)
-    parser.add_argument('--wandb', default=False, type=bool)
+    parser.add_argument('--wandb', default=True, type=bool)
     parser.add_argument('--wandb_keypoint_metric_weight', default=1, type=float)
     parser.add_argument('--wandb_keypoint_metric_thresh', default=0.2, type=float)
     return parser
@@ -71,10 +70,16 @@ def main(args):
 
     anchor = torch.tensor([args.anchor, args.anchor]).to(device)
 
-    model = RDDETR_2(anchor, device).to(device)
-    criterion = SetCriterion_2(anchor, args.empty_weight, device, args.threshold).to(device)
-    weight_dict = {'loss_keypoints': args.loss_keypoints_coef, 'loss_iou': args.loss_iou_coef,
-                   'loss_boxes': args.loss_boxes_coef, 'loss_conf': args.loss_object_coef}
+    model = RDDETR_2(anchor).to(device)
+
+    # matcher_weights = {'cost_boxes': args.matcher_cost_boxes, 'cost_keypoint': args.matcher_cost_keypoint,
+    #                    'cost_giou': args.matcher_cost_giou, 'cost_obj': args.matcher_cost_obj}
+
+    criterion = SetCriterion_2(anchor, args.empty_weight, device).to(device)
+    weight_dict = {'loss_boxes': args.loss_boxes_coef,
+                   'loss_keypoints': args.loss_keypoints_coef,
+                   'loss_conf': args.loss_object_coef,
+                   'loss_iou': args.loss_iou_coef}
 
     if args.wandb:
         wandb.watch(model)
@@ -102,8 +107,7 @@ def main(args):
                                       max_norm=args.clip_max_norm, use_wandb=args.wandb)
         lr_scheduler.step()
         keypoint_thresh_list = [eval(x) for x in args.val_keypoint_thresh_list.split(',')]
-        val_stats = evaluate(model=model, data_loader=test_dataloader, anchor=anchor, device=device,
-                             threshold=args.threshold,
+        val_stats = evaluate(model=model, data_loader=test_dataloader, device=device, anchor= anchor,
                              keypoint_thresh_list=keypoint_thresh_list, nms_iou_thresh=args.val_nms_iou_thresh,
                              matching_iou_thresh=args.val_matching_iou_thresh, conf_thresh=args.val_conf_thresh,
                              save_skeleton=False, save_attention_weight=False)
@@ -119,16 +123,18 @@ def main(args):
             keypoint_cdf = val_stats['keypoint_cdf']
             pr_size = 10000
             pr_skip = int(pr_curve[0].shape[0] / pr_size)
-            pr_curve = [[x, y] for (x, y) in zip(pr_curve[1][::pr_skip], pr_curve[0][::pr_skip])]
+            if pr_skip > 0:
+                pr_curve = [[x, y] for (x, y) in zip(pr_curve[1][::pr_skip], pr_curve[0][::pr_skip])]
+                pr_curve_table = wandb.Table(data=pr_curve, columns=["recall", "precision"])
+                wandb.log({"pr_curve": wandb.plot.line(pr_curve_table, "recall", "precision",
+                                                       title="Precision-recall curve")})
             kp_size = 1000
             kp_skip = int(keypoint_cdf.shape[0] / kp_size)
-            keypoint_cdf = [[x, y] for (x, y) in keypoint_cdf[::kp_skip, :]]
-            pr_curve_table = wandb.Table(data=pr_curve, columns=["recall", "precision"])
-            keypoint_cdf_table = wandb.Table(data=keypoint_cdf, columns=["error_dist", "cdf"])
-            wandb.log(
-                {"pr_curve": wandb.plot.line(pr_curve_table, "recall", "precision", title="Precision-recall curve"),
-                 "keypoint_cdf": wandb.plot.line(keypoint_cdf_table, "error_dist", "cdf", title="Keypoint error")})
-
+            if kp_skip > 0:
+                keypoint_cdf = [[x, y] for (x, y) in keypoint_cdf[::kp_skip, :]]
+                keypoint_cdf_table = wandb.Table(data=keypoint_cdf, columns=["error_dist", "cdf"])
+                wandb.log(
+                    {"keypoint_cdf": wandb.plot.line(keypoint_cdf_table, "error_dist", "cdf", title="Keypoint error")})
     if args.wandb:
         output_file = Path(wandb.run.dir) / args.model_file_name
         torch.save(model, output_file)
